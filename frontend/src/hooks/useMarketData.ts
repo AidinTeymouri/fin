@@ -7,6 +7,8 @@ export interface PriceUpdate {
   ticker: string;
   price: number;
   previous_price: number;
+  /** Session reference price; daily change % is measured from it. */
+  open_price: number;
   timestamp: string;
   direction: "up" | "down" | "flat";
 }

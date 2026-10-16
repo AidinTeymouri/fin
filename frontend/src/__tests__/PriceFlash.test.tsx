@@ -26,6 +26,7 @@ function tick(price: number, previous: number, direction: PriceUpdate["direction
       ticker: "AAPL",
       price,
       previous_price: previous,
+      open_price: previous,
       timestamp: "2026-01-01T00:00:00Z",
       direction,
     },

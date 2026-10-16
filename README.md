@@ -67,3 +67,20 @@ E2E (Playwright, runs against the app container with `LLM_MOCK=true`):
 ```bash
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ```
+
+## AI chat (`POST /api/chat`)
+
+- Calls `openrouter/openai/gpt-oss-120b` via LiteLLM with a strict JSON-schema
+  `response_format` generated from the pydantic `LLMResponse` model, routed to
+  **Cerebras** only (`provider.order=["cerebras"]`, `allow_fallbacks=false`,
+  `require_parameters=true`). If Cerebras can't serve the request the user gets a
+  friendly "try again" message rather than a silent reroute to a slower provider.
+- Never 500s on LLM trouble: network/provider errors, malformed or off-schema
+  output (raw content is logged), and a missing `OPENROUTER_API_KEY` all return
+  200 with an explanatory assistant message and no actions.
+- Trades go through the same `app.trading.execute_trade` as
+  `POST /api/portfolio/trade`; failures are listed in the reply and only executed
+  trades/watchlist changes are returned as actions.
+- `LLM_MOCK=true` (no key needed) is deterministic. Trades execute only for the
+  explicit phrase `<buy|sell> <quantity> <TICKER>`, e.g. **`buy 1 AAPL`** or
+  `sell 2 shares of TSLA`. "remove …" removes NFLX, "add …"/"watch …" adds PYPL.

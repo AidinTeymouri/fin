@@ -58,7 +58,7 @@ describe("PositionsTable calculations", () => {
 
     const tsla = within(rowFor("TSLA"));
     expect(tsla.getByText("$180.00")).toBeInTheDocument();
-    expect(tsla.getByText("$-100.00")).toHaveClass("text-red");
+    expect(tsla.getByText("-$100.00")).toHaveClass("text-red");
     expect(tsla.getByText("-10.0%")).toHaveClass("text-red");
   });
 
@@ -75,7 +75,7 @@ describe("PositionsTable calculations", () => {
     render(<PositionsTable positions={positions} prices={livePrice("AAPL", 90)} />);
 
     const aapl = within(rowFor("AAPL"));
-    expect(aapl.getByText("$-100.00")).toHaveClass("text-red");
+    expect(aapl.getByText("-$100.00")).toHaveClass("text-red");
     expect(aapl.getByText("-10.0%")).toHaveClass("text-red");
   });
 });

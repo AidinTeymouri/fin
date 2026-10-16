@@ -255,6 +255,46 @@ async def test_remove_ticker_keeps_tracking_held_position(client, provider):
     assert price_cache.get("AAPL") is not None
 
 
+async def _trade(client, ticker, side, quantity):
+    resp = await client.post(
+        "/api/portfolio/trade", json={"ticker": ticker, "quantity": quantity, "side": side}
+    )
+    assert resp.status_code == 200, resp.text
+
+
+async def test_selling_out_unwatched_ticker_stops_price_stream(client, provider):
+    await provider.add_ticker("PYPL")  # tracked, but not on the watchlist
+    await _trade(client, "PYPL", "buy", 3)
+
+    await _trade(client, "PYPL", "sell", 1)
+    assert "PYPL" in provider.get_tickers()
+    assert price_cache.get("PYPL") is not None
+
+    await _trade(client, "PYPL", "sell", 2)
+    assert "PYPL" not in provider.get_tickers()
+    assert price_cache.get("PYPL") is None
+
+
+async def test_selling_out_watched_ticker_keeps_price_stream(client, provider):
+    await provider.add_ticker("AAPL")  # on the default watchlist
+    await _trade(client, "AAPL", "buy", 2)
+    await _trade(client, "AAPL", "sell", 2)
+
+    assert "AAPL" in provider.get_tickers()
+    assert price_cache.get("AAPL") is not None
+
+
+async def test_chat_sell_out_of_unwatched_ticker_stops_price_stream(client, provider, monkeypatch):
+    monkeypatch.setenv("LLM_MOCK", "true")
+    await provider.add_ticker("PYPL")
+    await _trade(client, "PYPL", "buy", 1)
+
+    resp = await client.post("/api/chat", json={"message": "sell 1 PYPL"})
+    assert resp.status_code == 200
+    assert "PYPL" not in provider.get_tickers()
+    assert price_cache.get("PYPL") is None
+
+
 async def test_chat_watchlist_changes_update_provider(client, provider, monkeypatch):
     monkeypatch.setenv("LLM_MOCK", "true")
 

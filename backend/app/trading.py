@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from app.market.cache import price_cache
+from app.market.provider import get_provider
 
 
 class TradeError(Exception):
@@ -52,6 +53,14 @@ async def take_snapshot(db):
     )
 
 
+async def _on_watchlist(db, ticker: str) -> bool:
+    cursor = await db.execute(
+        "SELECT 1 FROM watchlist WHERE user_id = 'default' AND ticker = ?",
+        (ticker,),
+    )
+    return await cursor.fetchone() is not None
+
+
 async def execute_trade(db, ticker: str, side: str, quantity: float) -> TradeResult:
     """Execute a market order at the current cached price and commit it.
 
@@ -78,6 +87,7 @@ async def execute_trade(db, ticker: str, side: str, quantity: float) -> TradeRes
 
     now = datetime.now(timezone.utc).isoformat()
     trade_id = str(uuid.uuid4())
+    closed_position = False
 
     if side == "buy":
         total_cost = quantity * current_price
@@ -126,7 +136,8 @@ async def execute_trade(db, ticker: str, side: str, quantity: float) -> TradeRes
             )
 
         new_qty = existing["quantity"] - quantity
-        if new_qty == 0:
+        closed_position = new_qty == 0
+        if closed_position:
             await db.execute(
                 "DELETE FROM positions WHERE user_id = 'default' AND ticker = ?",
                 (ticker,),
@@ -154,6 +165,14 @@ async def execute_trade(db, ticker: str, side: str, quantity: float) -> TradeRes
     await take_snapshot(db)
 
     await db.commit()
+
+    # A closed position no longer needs prices unless the watchlist still wants them.
+    if closed_position and not await _on_watchlist(db, ticker):
+        provider = get_provider()
+        if provider is not None:
+            await provider.remove_ticker(ticker)
+        price_cache.remove(ticker)
+
     return TradeResult(
         id=trade_id,
         ticker=ticker,

@@ -12,6 +12,10 @@ from datetime import datetime, timezone
 from app.market.cache import price_cache
 from app.market.provider import get_provider
 
+# Fractional quantities are floats, so 0.1 + 0.2 != 0.3. Holdings within this
+# tolerance of the sell size count as enough, and a remainder this small is zero.
+QUANTITY_EPSILON = 1e-9
+
 
 class TradeError(Exception):
     """A trade was rejected by validation. ``str(err)`` is user-facing."""
@@ -129,14 +133,14 @@ async def execute_trade(db, ticker: str, side: str, quantity: float) -> TradeRes
             (ticker,),
         )
         existing = await cursor.fetchone()
-        if not existing or existing["quantity"] < quantity:
+        if not existing or existing["quantity"] < quantity - QUANTITY_EPSILON:
             held = existing["quantity"] if existing else 0
             raise TradeError(
                 f"Insufficient shares: want to sell {quantity:g} {ticker}, hold {held:g}"
             )
 
         new_qty = existing["quantity"] - quantity
-        closed_position = new_qty == 0
+        closed_position = new_qty <= QUANTITY_EPSILON
         if closed_position:
             await db.execute(
                 "DELETE FROM positions WHERE user_id = 'default' AND ticker = ?",

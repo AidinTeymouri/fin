@@ -11,8 +11,9 @@ __pycache__/
 # Environment
 .env
 
-# Database
-db/
+# Database (keep the volume mount point)
+db/*
+!db/.gitkeep
 **/db/finally.db
 
 # Next.js

@@ -6,7 +6,15 @@ from datetime import datetime, timezone
 
 import aiosqlite
 
-DB_PATH = os.environ.get("DB_PATH", "db/finally.db")
+from app.config import PROJECT_ROOT
+
+
+def resolve_db_path() -> str:
+    """DB_PATH env var if set, else <project root>/db/finally.db (independent of CWD)."""
+    return os.environ.get("DB_PATH") or str(PROJECT_ROOT / "db" / "finally.db")
+
+
+DB_PATH = resolve_db_path()
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users_profile (

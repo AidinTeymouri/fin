@@ -27,6 +27,12 @@ TICKER_CONFIG = {
 TECH_TICKERS = ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "NFLX"]
 FINANCE_TICKERS = ["JPM", "V"]
 
+# Parameters for tickers not in TICKER_CONFIG
+DEFAULT_DRIFT = 0.08
+DEFAULT_VOL = 0.30
+UNKNOWN_SEED_MIN = 20.0
+UNKNOWN_SEED_MAX = 500.0
+
 UPDATE_INTERVAL = 0.5  # seconds
 EVENT_PROBABILITY = 0.005  # per ticker per update
 EVENT_MIN_PCT = 0.02
@@ -49,16 +55,46 @@ def _build_correlation_matrix(tickers: list[str]) -> np.ndarray:
     return corr
 
 
+def _ticker_params(ticker: str) -> dict:
+    """Seed price, drift and vol for a ticker.
+
+    Unknown tickers get a plausible seed price that is stable per symbol (so a
+    ticker re-added later starts near the same level) and default drift/vol.
+    """
+    if ticker in TICKER_CONFIG:
+        return TICKER_CONFIG[ticker]
+    seed = random.Random(ticker).uniform(UNKNOWN_SEED_MIN, UNKNOWN_SEED_MAX)
+    return {"seed": round(seed, 2), "drift": DEFAULT_DRIFT, "vol": DEFAULT_VOL}
+
+
 class Simulator(MarketDataProvider):
     """GBM-based market data simulator."""
 
-    def __init__(self):
+    def __init__(self, tickers: list[str] | None = None):
         self._task: asyncio.Task | None = None
-        self._tickers = list(TICKER_CONFIG.keys())
-        self._prices = {t: cfg["seed"] for t, cfg in TICKER_CONFIG.items()}
         self._dt = UPDATE_INTERVAL / (252 * 6.5 * 3600)  # fraction of trading year
+        self._tickers: list[str] = []
+        self._params: dict[str, dict] = {}
+        self._prices: dict[str, float] = {}
+        self._cholesky = np.zeros((0, 0))
 
-        # Precompute Cholesky decomposition for correlated random draws
+        initial = list(TICKER_CONFIG.keys()) if tickers is None else tickers
+        for ticker in initial:
+            self._track(ticker)
+        self._rebuild_correlation()
+
+    def _track(self, ticker: str) -> bool:
+        """Add ticker to the simulated set. Returns False if already tracked."""
+        if ticker in self._params:
+            return False
+        params = _ticker_params(ticker)
+        self._tickers.append(ticker)
+        self._params[ticker] = params
+        self._prices[ticker] = params["seed"]
+        return True
+
+    def _rebuild_correlation(self) -> None:
+        """Precompute Cholesky decomposition for correlated random draws."""
         corr = _build_correlation_matrix(self._tickers)
         self._cholesky = np.linalg.cholesky(corr)
 
@@ -68,6 +104,25 @@ class Simulator(MarketDataProvider):
         for ticker, price in self._prices.items():
             price_cache.update(ticker, price)
         self._task = asyncio.create_task(self._run())
+
+    async def add_ticker(self, ticker: str) -> None:
+        """Start simulating a ticker; its seed price is published immediately."""
+        if self._track(ticker):
+            self._rebuild_correlation()
+        if price_cache.get(ticker) is None:
+            price_cache.update(ticker, self._prices[ticker])
+
+    async def remove_ticker(self, ticker: str) -> None:
+        """Stop simulating a ticker and evict it from the price cache."""
+        if ticker in self._params:
+            self._tickers.remove(ticker)
+            del self._params[ticker]
+            del self._prices[ticker]
+            self._rebuild_correlation()
+        price_cache.remove(ticker)
+
+    def get_tickers(self) -> list[str]:
+        return list(self._tickers)
 
     async def stop(self) -> None:
         """Stop the simulation loop."""
@@ -87,12 +142,14 @@ class Simulator(MarketDataProvider):
     def _step(self) -> None:
         """Advance all prices by one GBM step with correlation."""
         n = len(self._tickers)
+        if n == 0:
+            return
         # Correlated normal draws
         z_independent = np.random.standard_normal(n)
         z_correlated = self._cholesky @ z_independent
 
         for i, ticker in enumerate(self._tickers):
-            cfg = TICKER_CONFIG[ticker]
+            cfg = self._params[ticker]
             drift = cfg["drift"]
             vol = cfg["vol"]
             s = self._prices[ticker]

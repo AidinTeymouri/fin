@@ -13,11 +13,11 @@ from app.config import PROJECT_ROOT, load_env
 load_env()
 
 from app.chat import router as chat_router  # noqa: E402
-from app.database import init_db  # noqa: E402
-from app.market.provider import create_provider  # noqa: E402
+from app.database import get_db, init_db  # noqa: E402
+from app.market.provider import create_provider, set_provider  # noqa: E402
 from app.market.stream import router as stream_router  # noqa: E402
 from app.portfolio import router as portfolio_router  # noqa: E402
-from app.watchlist import router as watchlist_router  # noqa: E402
+from app.watchlist import load_tracked_tickers, router as watchlist_router  # noqa: E402
 from app.snapshots import start_snapshot_recorder, stop_snapshot_recorder  # noqa: E402
 
 
@@ -25,12 +25,20 @@ from app.snapshots import start_snapshot_recorder, stop_snapshot_recorder  # noq
 async def lifespan(app: FastAPI):
     """Initialize database, start market data provider and snapshot recorder."""
     await init_db()
-    provider = create_provider()
+    db = await get_db()
+    try:
+        tickers = await load_tracked_tickers(db)
+    finally:
+        await db.close()
+    provider = create_provider(tickers)
     await provider.start()
+    set_provider(provider)
+    app.state.market_provider = provider
     start_snapshot_recorder()
     yield
     stop_snapshot_recorder()
     await provider.stop()
+    set_provider(None)
 
 
 app = FastAPI(title="FinAlly", lifespan=lifespan)

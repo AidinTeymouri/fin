@@ -302,26 +302,17 @@ async def _execute_trade(
 
 async def _execute_watchlist_change(db, ticker: str, action: str) -> str | None:
     """Add/remove a ticker from watchlist. Returns error string on failure."""
-    now = datetime.now(timezone.utc).isoformat()
+    from app.watchlist import WatchlistError, add_to_watchlist, remove_from_watchlist
 
-    if action == "add":
-        try:
-            await db.execute(
-                "INSERT INTO watchlist (id, user_id, ticker, added_at) VALUES (?, 'default', ?, ?)",
-                (str(uuid.uuid4()), ticker.upper(), now),
-            )
-            await db.commit()
-        except Exception:
-            return f"{ticker} is already on the watchlist"
-
-    elif action == "remove":
-        cur = await db.execute(
-            "DELETE FROM watchlist WHERE user_id = 'default' AND ticker = ?",
-            (ticker.upper(),),
-        )
-        await db.commit()
-        if cur.rowcount == 0:
-            return f"{ticker} is not on the watchlist"
+    try:
+        if action == "add":
+            await add_to_watchlist(db, ticker)
+        elif action == "remove":
+            await remove_from_watchlist(db, ticker)
+        else:
+            return f"Invalid watchlist action: {action}"
+    except WatchlistError as e:
+        return str(e)
 
     return None
 

@@ -16,14 +16,16 @@ DEFAULT_POLL_INTERVAL = 15  # seconds (free tier: 5 calls/min)
 
 
 class MassiveClient(MarketDataProvider):
-    """Polls Polygon.io REST API for live market data."""
+    """Polls Polygon.io REST API for live market data on the tracked ticker set."""
 
     def __init__(self, tickers: list[str]):
         self._api_key = os.environ["MASSIVE_API_KEY"]
-        self._tickers = tickers
+        self._tickers: list[str] = list(dict.fromkeys(tickers))
         self._poll_interval = float(os.environ.get("MASSIVE_POLL_INTERVAL", DEFAULT_POLL_INTERVAL))
         self._task: asyncio.Task | None = None
         self._client: httpx.AsyncClient | None = None
+        # Set to cut the current sleep short so a newly added ticker is fetched promptly
+        self._wake = asyncio.Event()
 
     async def start(self) -> None:
         self._client = httpx.AsyncClient(timeout=10.0)
@@ -39,14 +41,33 @@ class MassiveClient(MarketDataProvider):
         if self._client:
             await self._client.aclose()
 
+    async def add_ticker(self, ticker: str) -> None:
+        if ticker not in self._tickers:
+            self._tickers.append(ticker)
+            self._wake.set()
+
+    async def remove_ticker(self, ticker: str) -> None:
+        if ticker in self._tickers:
+            self._tickers.remove(ticker)
+        price_cache.remove(ticker)
+
+    def get_tickers(self) -> list[str]:
+        return list(self._tickers)
+
     async def _run(self) -> None:
         """Poll loop."""
         while True:
+            self._wake.clear()
             await self._poll()
-            await asyncio.sleep(self._poll_interval)
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=self._poll_interval)
+            except asyncio.TimeoutError:
+                pass
 
     async def _poll(self) -> None:
-        """Fetch latest prices for all tickers from Polygon.io snapshot endpoint."""
+        """Fetch latest prices for all tracked tickers from Polygon.io snapshot endpoint."""
+        if not self._tickers:
+            return
         tickers_csv = ",".join(self._tickers)
         url = f"{POLYGON_BASE_URL}/v2/snapshot/locale/us/markets/stocks/tickers"
         params = {"tickers": tickers_csv, "apiKey": self._api_key}
@@ -60,7 +81,8 @@ class MassiveClient(MarketDataProvider):
                 ticker = item.get("ticker")
                 last_trade = item.get("lastTrade", {})
                 price = last_trade.get("p")
-                if ticker and price is not None:
+                # Skip tickers removed while the request was in flight
+                if ticker in self._tickers and price is not None:
                     price_cache.update(ticker, float(price))
 
         except httpx.HTTPError as e:

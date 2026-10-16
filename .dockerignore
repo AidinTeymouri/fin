@@ -5,8 +5,11 @@
 .logs
 .env
 db/
-node_modules/
-__pycache__/
-.venv/
-.next/
-out/
+**/node_modules/
+**/__pycache__/
+**/.venv/
+**/.next/
+**/out/
+**/.pytest_cache/
+test-results/
+playwright-report/

@@ -73,6 +73,8 @@ export interface WatchlistItem {
   ticker: string;
   price?: number;
   previous_price?: number;
+  open_price?: number;
+  /** Daily change % vs open_price. */
   change_percent?: number;
 }
 

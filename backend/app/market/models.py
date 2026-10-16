@@ -9,5 +9,6 @@ class PriceUpdate(BaseModel):
     ticker: str
     price: float
     previous_price: float
+    open_price: float  # session reference price; daily change is measured from it
     timestamp: str
     direction: str  # "up", "down", or "flat"

@@ -113,7 +113,8 @@ class WatchlistItem(BaseModel):
     ticker: str
     price: float | None = None
     previous_price: float | None = None
-    change_percent: float | None = None
+    open_price: float | None = None
+    change_percent: float | None = None  # daily change vs open_price
 
 
 @router.get("", response_model=list[WatchlistItem])
@@ -130,12 +131,13 @@ async def get_watchlist():
             ticker = row["ticker"]
             update = price_cache.get(ticker)
             if update:
-                prev = update.previous_price
-                change_pct = ((update.price - prev) / prev * 100) if prev else None
+                ref = update.open_price
+                change_pct = ((update.price - ref) / ref * 100) if ref else None
                 items.append(WatchlistItem(
                     ticker=ticker,
                     price=update.price,
-                    previous_price=prev,
+                    previous_price=update.previous_price,
+                    open_price=ref,
                     change_percent=round(change_pct, 2) if change_pct is not None else None,
                 ))
             else:

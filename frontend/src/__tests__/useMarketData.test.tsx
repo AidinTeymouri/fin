@@ -8,6 +8,7 @@ function update(ticker: string, price: number, previous: number) {
     ticker,
     price,
     previous_price: previous,
+    open_price: previous,
     timestamp: "2026-01-01T00:00:00Z",
     direction: price > previous ? "up" : price < previous ? "down" : "flat",
   };

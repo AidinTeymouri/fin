@@ -30,6 +30,7 @@ function livePrice(ticker: string, price: number): PriceMap {
       ticker,
       price,
       previous_price: price,
+      open_price: price,
       timestamp: "2026-01-01T00:00:00Z",
       direction: "flat",
     },

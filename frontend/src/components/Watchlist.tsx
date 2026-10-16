@@ -135,11 +135,12 @@ function WatchlistRow({
     return () => clearTimeout(timer);
   }, [priceData]);
 
+  // Daily change is measured from the session open; tick direction only drives the flash.
   const price = priceData?.price;
-  const prevPrice = priceData?.previous_price;
+  const openPrice = priceData?.open_price;
   const changePct =
-    price != null && prevPrice != null && prevPrice > 0
-      ? ((price - prevPrice) / prevPrice) * 100
+    price != null && openPrice != null && openPrice > 0
+      ? ((price - openPrice) / openPrice) * 100
       : null;
 
   return (

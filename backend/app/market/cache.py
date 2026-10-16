@@ -13,10 +13,17 @@ class PriceCache:
         self._prices: dict[str, PriceUpdate] = {}
         self._event = asyncio.Event()
 
-    def update(self, ticker: str, price: float) -> PriceUpdate:
-        """Update price for a ticker and return the PriceUpdate."""
+    def update(self, ticker: str, price: float, open_price: float | None = None) -> PriceUpdate:
+        """Update price for a ticker and return the PriceUpdate.
+
+        `open_price` is the session reference that daily change is measured
+        from. When omitted, the ticker keeps its existing reference, or uses
+        this price if it is the first one seen since it entered the cache.
+        """
         prev = self._prices.get(ticker)
         previous_price = prev.price if prev else price
+        if open_price is None:
+            open_price = prev.open_price if prev else price
 
         if price > previous_price:
             direction = "up"
@@ -29,6 +36,7 @@ class PriceCache:
             ticker=ticker,
             price=round(price, 2),
             previous_price=round(previous_price, 2),
+            open_price=round(open_price, 2),
             timestamp=datetime.now(timezone.utc).isoformat(),
             direction=direction,
         )

@@ -15,6 +15,18 @@ POLYGON_BASE_URL = "https://api.polygon.io"
 DEFAULT_POLL_INTERVAL = 15  # seconds (free tier: 5 calls/min)
 
 
+def _reference_price(item: dict) -> float | None:
+    """Daily-change reference from a snapshot: prior close, else today's open.
+
+    None (missing or zero in both) lets the cache fall back to the first price seen.
+    """
+    for key, field in (("prevDay", "c"), ("day", "o")):
+        value = (item.get(key) or {}).get(field)
+        if value:
+            return float(value)
+    return None
+
+
 class MassiveClient(MarketDataProvider):
     """Polls Polygon.io REST API for live market data on the tracked ticker set."""
 
@@ -83,7 +95,7 @@ class MassiveClient(MarketDataProvider):
                 price = last_trade.get("p")
                 # Skip tickers removed while the request was in flight
                 if ticker in self._tickers and price is not None:
-                    price_cache.update(ticker, float(price))
+                    price_cache.update(ticker, float(price), _reference_price(item))
 
         except httpx.HTTPError as e:
             logger.error("Massive API poll failed: %s", e)

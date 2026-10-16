@@ -101,12 +101,13 @@ describe("ChatPanel", () => {
       () => new Promise((resolve) => { resolveChat = resolve; })
     );
 
-    render(<ChatPanel />);
+    const { container } = render(<ChatPanel />);
     const input = screen.getByPlaceholderText("Message...");
     fireEvent.change(input, { target: { value: "test" } });
     fireEvent.click(screen.getByText("Send"));
 
-    // Input should be disabled during loading
+    // Loading dots shown and input disabled during loading
+    expect(container.querySelectorAll(".animate-pulse")).toHaveLength(3);
     expect(screen.getByPlaceholderText("Message...")).toBeDisabled();
 
     // Resolve the promise
@@ -115,6 +116,8 @@ describe("ChatPanel", () => {
     await waitFor(() => {
       expect(screen.getByPlaceholderText("Message...")).not.toBeDisabled();
     });
+    expect(container.querySelectorAll(".animate-pulse")).toHaveLength(0);
+    expect(screen.getByText("done")).toBeInTheDocument();
   });
 
   it("calls onDataRefresh after trades", async () => {

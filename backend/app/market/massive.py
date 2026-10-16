@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import os
 
 import httpx
@@ -15,15 +16,25 @@ POLYGON_BASE_URL = "https://api.polygon.io"
 DEFAULT_POLL_INTERVAL = 15  # seconds (free tier: 5 calls/min)
 
 
+def _positive_number(value) -> float | None:
+    """`value` as a float if it is a finite, positive number (not a bool), else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return float(value)
+
+
 def _reference_price(item: dict) -> float | None:
     """Daily-change reference from a snapshot: prior close, else today's open.
 
     None (missing or zero in both) lets the cache fall back to the first price seen.
     """
     for key, field in (("prevDay", "c"), ("day", "o")):
-        value = (item.get(key) or {}).get(field)
-        if value:
-            return float(value)
+        bar = item.get(key)
+        value = _positive_number(bar.get(field)) if isinstance(bar, dict) else None
+        if value is not None:
+            return value
     return None
 
 
@@ -84,18 +95,43 @@ class MassiveClient(MarketDataProvider):
         url = f"{POLYGON_BASE_URL}/v2/snapshot/locale/us/markets/stocks/tickers"
         params = {"tickers": tickers_csv, "apiKey": self._api_key}
 
+        # Any exception escaping here would kill the poll task and freeze prices,
+        # so HTTP errors (incl. 429 rate limits) and malformed payloads are logged
+        # and skipped until the next poll.
         try:
             resp = await self._client.get(url, params=params)
             resp.raise_for_status()
             data = resp.json()
-
-            for item in data.get("tickers", []):
-                ticker = item.get("ticker")
-                last_trade = item.get("lastTrade", {})
-                price = last_trade.get("p")
-                # Skip tickers removed while the request was in flight
-                if ticker in self._tickers and price is not None:
-                    price_cache.update(ticker, float(price), _reference_price(item))
-
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, ValueError) as e:
             logger.error("Massive API poll failed: %s", e)
+            return
+
+        items = data.get("tickers") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            logger.error("Massive API returned an unexpected payload: %.200r", data)
+            return
+
+        for ticker, price, reference in parse_snapshot_items(items):
+            # Skip tickers removed while the request was in flight
+            if ticker in self._tickers:
+                price_cache.update(ticker, price, reference)
+
+
+def parse_snapshot_items(items: list) -> list[tuple[str, float, float | None]]:
+    """Extract (ticker, last trade price, daily-change reference) from Polygon snapshot items.
+
+    Items without a usable ticker or a finite, positive last trade price are skipped.
+    """
+    parsed = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        ticker = item.get("ticker")
+        last_trade = item.get("lastTrade")
+        if not isinstance(ticker, str) or not isinstance(last_trade, dict):
+            continue
+        price = _positive_number(last_trade.get("p"))
+        if price is None:
+            continue
+        parsed.append((ticker, price, _reference_price(item)))
+    return parsed

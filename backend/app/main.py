@@ -2,19 +2,23 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.chat import router as chat_router
-from app.database import init_db
-from app.market.provider import create_provider
-from app.market.stream import router as stream_router
-from app.portfolio import router as portfolio_router
-from app.watchlist import router as watchlist_router
-from app.snapshots import start_snapshot_recorder, stop_snapshot_recorder
+from app.config import PROJECT_ROOT, load_env
+
+# Load .env before importing modules that read the environment at import time
+load_env()
+
+from app.chat import router as chat_router  # noqa: E402
+from app.database import init_db  # noqa: E402
+from app.market.provider import create_provider  # noqa: E402
+from app.market.stream import router as stream_router  # noqa: E402
+from app.portfolio import router as portfolio_router  # noqa: E402
+from app.watchlist import router as watchlist_router  # noqa: E402
+from app.snapshots import start_snapshot_recorder, stop_snapshot_recorder  # noqa: E402
 
 
 @asynccontextmanager
@@ -43,6 +47,6 @@ async def health():
 
 
 # Serve static files (Next.js export) at root, if the directory exists
-static_dir = Path(__file__).parent.parent.parent / "static"
+static_dir = PROJECT_ROOT / "static"
 if static_dir.is_dir():
     app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")

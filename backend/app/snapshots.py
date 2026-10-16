@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from app.database import get_db
-from app.portfolio import take_snapshot
+from app.trading import take_snapshot
 
 log = logging.getLogger(__name__)
 

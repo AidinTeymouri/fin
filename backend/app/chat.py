@@ -1,16 +1,22 @@
 """POST /api/chat — LLM chat with auto-execution of trades and watchlist changes."""
 
 import json
+import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 
 from litellm import acompletion
 
 from app.database import get_db
+from app.trading import TradeError, execute_trade
+
+log = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -25,19 +31,106 @@ class ChatRequest(BaseModel):
 
 class TradeAction(BaseModel):
     ticker: str
-    side: str
-    quantity: float
+    side: Literal["buy", "sell"]
+    quantity: float = Field(gt=0, description="Number of shares; must be > 0")
 
 
 class WatchlistChange(BaseModel):
     ticker: str
-    action: str  # "add" | "remove"
+    action: Literal["add", "remove"]
+
+
+class LLMResponse(BaseModel):
+    """Structured output the LLM must produce (sent to it as a JSON schema)."""
+
+    message: str
+    trades: list[TradeAction] = Field(default_factory=list)
+    watchlist_changes: list[WatchlistChange] = Field(default_factory=list)
+
+
+class ExecutedTrade(BaseModel):
+    ticker: str
+    side: str
+    quantity: float
+    price: float
 
 
 class ChatResponse(BaseModel):
+    """API response. Lists only the actions that actually executed; failures
+    are explained in ``message``."""
+
     message: str
-    trades: list[TradeAction] | None = None
+    trades: list[ExecutedTrade] | None = None
     watchlist_changes: list[WatchlistChange] | None = None
+
+
+# ---------------------------------------------------------------------------
+# LLM configuration
+# ---------------------------------------------------------------------------
+
+LLM_MODEL = "openrouter/openai/gpt-oss-120b"
+
+# Pin inference to Cerebras (SPEC §9). allow_fallbacks is off: if Cerebras
+# can't serve the request we'd rather show a friendly error than silently route
+# to a slower provider. require_parameters makes OpenRouter reject the request
+# instead of quietly ignoring response_format.
+OPENROUTER_PROVIDER = {
+    "order": ["cerebras"],
+    "allow_fallbacks": False,
+    "require_parameters": True,
+}
+
+
+def _strict_json_schema(model: type[BaseModel]) -> dict:
+    """Pydantic JSON schema adapted for strict structured outputs.
+
+    Strict mode requires every object to list all its properties as required
+    and set ``additionalProperties: false``. Numeric bounds aren't supported by
+    every strict-mode provider, so they're dropped here and enforced by pydantic
+    when parsing.
+    """
+
+    def visit(node):
+        if isinstance(node, dict):
+            node.pop("exclusiveMinimum", None)
+            if node.get("type") == "object" and "properties" in node:
+                node["required"] = list(node["properties"])
+                node["additionalProperties"] = False
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    schema = model.model_json_schema()
+    visit(schema)
+    return schema
+
+
+RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "chat_response",
+        "strict": True,
+        "schema": _strict_json_schema(LLMResponse),
+    },
+}
+
+MISSING_KEY_MESSAGE = (
+    "The AI assistant isn't configured yet: set OPENROUTER_API_KEY in the .env "
+    "file and restart (or set LLM_MOCK=true to use mock responses)."
+)
+LLM_UNAVAILABLE_MESSAGE = (
+    "Sorry, I couldn't reach the AI model just now. Please try again in a moment."
+)
+LLM_MALFORMED_MESSAGE = (
+    "Sorry, I got a garbled response from the AI model and didn't act on it. "
+    "Please try again or rephrase your request."
+)
+
+
+class LLMError(Exception):
+    """The LLM call failed or returned unusable output. ``str(err)`` is user-facing."""
 
 
 # ---------------------------------------------------------------------------
@@ -54,18 +147,14 @@ Your capabilities:
 - Manage the watchlist (add/remove tickers)
 - Be concise and data-driven
 
-You MUST respond with valid JSON matching this schema:
-{
-  "message": "Your conversational response to the user",
-  "trades": [{"ticker": "AAPL", "side": "buy", "quantity": 10}],
-  "watchlist_changes": [{"ticker": "PYPL", "action": "add"}]
-}
+Respond with JSON matching the provided schema:
+- "message": your conversational response to the user (always required).
+- "trades": trades to execute now; use [] when not trading.
+- "watchlist_changes": watchlist edits to apply now; use [] when none.
 
 Rules:
-- "message" is always required.
-- "trades" is optional — include only when executing trades.
-- "watchlist_changes" is optional — include only when modifying the watchlist.
-- side must be "buy" or "sell". action must be "add" or "remove".
+- side must be "buy" or "sell"; quantity must be a positive number of shares.
+- action must be "add" or "remove".
 - Only execute trades when the user explicitly asks or agrees.
 - Keep responses concise."""
 
@@ -132,167 +221,68 @@ async def _load_history(db, limit: int = 20) -> list[dict]:
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
+
+
 # ---------------------------------------------------------------------------
 # Mock mode
 # ---------------------------------------------------------------------------
 
+# "buy 1 AAPL", "sell 2 shares of TSLA", "Buy 0.5 shares NVDA"
+_MOCK_TRADE_RE = re.compile(
+    r"\b(buy|sell)\s+(\d+(?:\.\d+)?)\s+(?:shares?\s+(?:of\s+)?)?\$?([a-z][a-z.]*)\b",
+    re.IGNORECASE,
+)
 
-def _mock_response(message: str) -> ChatResponse:
-    """Return deterministic mock responses for testing."""
+
+def _mock_response(message: str) -> LLMResponse:
+    """Return deterministic mock responses (LLM_MOCK=true).
+
+    Trades execute only for the explicit form "<buy|sell> <quantity> <TICKER>"
+    (e.g. "buy 1 AAPL"), so E2E tests can assert inline trade confirmations
+    without vaguer messages like "what should I buy?" moving money.
+    """
     lower = message.lower()
 
-    if any(w in lower for w in ["hi", "hello", "hey"]):
-        return ChatResponse(
-            message="Hello! I'm FinAlly, your AI trading assistant. "
-            "I can analyze your portfolio, suggest trades, and manage your watchlist. "
-            "How can I help you today?"
+    trade = _MOCK_TRADE_RE.search(message)
+    if trade:
+        side = trade.group(1).lower()
+        quantity = float(trade.group(2))
+        ticker = trade.group(3).upper()
+        return LLMResponse(
+            message=f"Placing a market order to {side} {quantity:g} {ticker}.",
+            trades=[TradeAction(ticker=ticker, side=side, quantity=quantity)],
+        )
+
+    if "remove" in lower:
+        return LLMResponse(
+            message="Removing NFLX from your watchlist.",
+            watchlist_changes=[WatchlistChange(ticker="NFLX", action="remove")],
+        )
+
+    if "watch" in lower or "add" in lower:
+        return LLMResponse(
+            message="Adding PYPL to your watchlist.",
+            watchlist_changes=[WatchlistChange(ticker="PYPL", action="add")],
         )
 
     if "portfolio" in lower or "positions" in lower or "holdings" in lower:
-        return ChatResponse(
+        return LLMResponse(
             message="Your portfolio currently has $10,000.00 in cash with no open positions. "
             "You're watching AAPL, GOOGL, MSFT, AMZN, TSLA, NVDA, META, JPM, V, NFLX. "
             "Would you like to make a trade?"
         )
 
-    if "buy" in lower:
-        # Extract ticker if mentioned
-        ticker = "AAPL"
-        for t in ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "NFLX"]:
-            if t.lower() in lower:
-                ticker = t
-                break
-        return ChatResponse(
-            message=f"Buying 10 shares of {ticker} for you.",
-            trades=[TradeAction(ticker=ticker, side="buy", quantity=10)],
+    if re.search(r"\b(hi|hello|hey)\b", lower):
+        return LLMResponse(
+            message="Hello! I'm FinAlly, your AI trading assistant. "
+            "I can analyze your portfolio, suggest trades, and manage your watchlist. "
+            "How can I help you today?"
         )
 
-    if "sell" in lower:
-        ticker = "AAPL"
-        for t in ["AAPL", "GOOGL", "MSFT", "AMZN", "TSLA", "NVDA", "META", "JPM", "V", "NFLX"]:
-            if t.lower() in lower:
-                ticker = t
-                break
-        return ChatResponse(
-            message=f"Selling 10 shares of {ticker} for you.",
-            trades=[TradeAction(ticker=ticker, side="sell", quantity=10)],
-        )
-
-    if "watch" in lower or "add" in lower:
-        return ChatResponse(
-            message="Adding PYPL to your watchlist.",
-            watchlist_changes=[WatchlistChange(ticker="PYPL", action="add")],
-        )
-
-    if "remove" in lower:
-        return ChatResponse(
-            message="Removing NFLX from your watchlist.",
-            watchlist_changes=[WatchlistChange(ticker="NFLX", action="remove")],
-        )
-
-    return ChatResponse(
+    return LLMResponse(
         message="I can help you trade, analyze your portfolio, or manage your watchlist. "
-        "What would you like to do?"
+        'Try "buy 1 AAPL" to place a trade. What would you like to do?'
     )
-
-
-# ---------------------------------------------------------------------------
-# Trade execution
-# ---------------------------------------------------------------------------
-
-
-async def _execute_trade(
-    db, ticker: str, side: str, quantity: float
-) -> str | None:
-    """Execute a trade. Returns error string on failure, None on success."""
-    # We need a price. Use avg_cost for sells, or a default for buys.
-    # In a full system this comes from the price cache. For now, use a
-    # placeholder price of 100.0 if no market data is available.
-    # TODO: integrate with market data price cache when available
-    price = 150.0  # default placeholder
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    if side == "buy":
-        cost = price * quantity
-        cur = await db.execute(
-            "SELECT cash_balance FROM users_profile WHERE id = 'default'"
-        )
-        row = await cur.fetchone()
-        cash = row["cash_balance"]
-        if cost > cash:
-            return f"Insufficient cash: need ${cost:,.2f} but only have ${cash:,.2f}"
-
-        # Deduct cash
-        await db.execute(
-            "UPDATE users_profile SET cash_balance = cash_balance - ? WHERE id = 'default'",
-            (cost,),
-        )
-
-        # Upsert position
-        cur = await db.execute(
-            "SELECT quantity, avg_cost FROM positions WHERE user_id = 'default' AND ticker = ?",
-            (ticker,),
-        )
-        existing = await cur.fetchone()
-        if existing:
-            old_qty = existing["quantity"]
-            old_cost = existing["avg_cost"]
-            new_qty = old_qty + quantity
-            new_avg = ((old_qty * old_cost) + (quantity * price)) / new_qty
-            await db.execute(
-                "UPDATE positions SET quantity = ?, avg_cost = ?, updated_at = ? "
-                "WHERE user_id = 'default' AND ticker = ?",
-                (new_qty, new_avg, now, ticker),
-            )
-        else:
-            await db.execute(
-                "INSERT INTO positions (id, user_id, ticker, quantity, avg_cost, updated_at) "
-                "VALUES (?, 'default', ?, ?, ?, ?)",
-                (str(uuid.uuid4()), ticker, quantity, price, now),
-            )
-
-    elif side == "sell":
-        cur = await db.execute(
-            "SELECT quantity, avg_cost FROM positions WHERE user_id = 'default' AND ticker = ?",
-            (ticker,),
-        )
-        existing = await cur.fetchone()
-        if not existing or existing["quantity"] < quantity:
-            held = existing["quantity"] if existing else 0
-            return f"Insufficient shares: want to sell {quantity} {ticker} but hold {held}"
-
-        price = existing["avg_cost"]  # sell at avg cost for now
-        proceeds = price * quantity
-        new_qty = existing["quantity"] - quantity
-
-        await db.execute(
-            "UPDATE users_profile SET cash_balance = cash_balance + ? WHERE id = 'default'",
-            (proceeds,),
-        )
-
-        if new_qty <= 0:
-            await db.execute(
-                "DELETE FROM positions WHERE user_id = 'default' AND ticker = ?",
-                (ticker,),
-            )
-        else:
-            await db.execute(
-                "UPDATE positions SET quantity = ?, updated_at = ? "
-                "WHERE user_id = 'default' AND ticker = ?",
-                (new_qty, now, ticker),
-            )
-    else:
-        return f"Invalid side: {side}"
-
-    # Record trade
-    await db.execute(
-        "INSERT INTO trades (id, user_id, ticker, side, quantity, price, executed_at) "
-        "VALUES (?, 'default', ?, ?, ?, ?, ?)",
-        (str(uuid.uuid4()), ticker, side, quantity, price, now),
-    )
-    await db.commit()
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -322,19 +312,52 @@ async def _execute_watchlist_change(db, ticker: str, action: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-async def _call_llm(messages: list[dict]) -> ChatResponse:
-    """Call LLM via LiteLLM -> OpenRouter and parse structured response."""
-    response = await acompletion(
-        model="openrouter/openai/gpt-oss-120b",
-        messages=messages,
-        extra_body={
-            "response_format": {"type": "json_object"},
-        },
-    )
+async def _call_llm(messages: list[dict]) -> LLMResponse:
+    """Call the LLM via LiteLLM -> OpenRouter -> Cerebras with structured outputs.
 
-    content = response.choices[0].message.content
-    parsed = json.loads(content)
-    return ChatResponse(**parsed)
+    Raises LLMError (with a user-facing message) on network/provider errors or
+    output that doesn't match the schema.
+    """
+    try:
+        response = await acompletion(
+            model=LLM_MODEL,
+            messages=messages,
+            response_format=RESPONSE_FORMAT,
+            extra_body={"provider": OPENROUTER_PROVIDER},
+        )
+    except Exception as e:
+        log.exception("LLM call failed")
+        raise LLMError(LLM_UNAVAILABLE_MESSAGE) from e
+
+    content = None
+    try:
+        content = response.choices[0].message.content
+        return LLMResponse.model_validate_json(content or "")
+    except (AttributeError, IndexError, TypeError, ValidationError) as e:
+        log.warning("Malformed LLM output (%s); raw content: %r", e, content)
+        raise LLMError(LLM_MALFORMED_MESSAGE) from e
+
+
+async def _get_llm_response(db, user_message: str) -> LLMResponse:
+    """Produce the assistant's response, degrading to a plain message on failure."""
+    if os.environ.get("LLM_MOCK", "").lower() == "true":
+        return _mock_response(user_message)
+
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        return LLMResponse(message=MISSING_KEY_MESSAGE)
+
+    portfolio_ctx = await _load_portfolio_context(db)
+    history = await _load_history(db)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": f"Current portfolio state:\n{portfolio_ctx}"},
+        *history,
+        {"role": "user", "content": user_message},
+    ]
+    try:
+        return await _call_llm(messages)
+    except LLMError as e:
+        return LLMResponse(message=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -347,48 +370,44 @@ async def chat(req: ChatRequest):
     """Send a message and receive a structured response with auto-executed actions."""
     db = await get_db()
     try:
-        # Check mock mode
-        if os.environ.get("LLM_MOCK", "").lower() == "true":
-            result = _mock_response(req.message)
-        else:
-            # Build LLM messages
-            portfolio_ctx = await _load_portfolio_context(db)
-            history = await _load_history(db)
+        llm = await _get_llm_response(db, req.message)
 
-            messages = [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {
-                    "role": "system",
-                    "content": f"Current portfolio state:\n{portfolio_ctx}",
-                },
-                *history,
-                {"role": "user", "content": req.message},
-            ]
-
-            result = await _call_llm(messages)
-
-        # Auto-execute trades
         errors = []
-        if result.trades:
-            for trade in result.trades:
-                err = await _execute_trade(
-                    db, trade.ticker, trade.side, trade.quantity
+
+        # Auto-execute trades through the same path as POST /api/portfolio/trade
+        executed = []
+        for trade in llm.trades:
+            try:
+                r = await execute_trade(db, trade.ticker, trade.side, trade.quantity)
+            except TradeError as e:
+                errors.append(str(e))
+                continue
+            executed.append(
+                ExecutedTrade(
+                    ticker=r.ticker, side=r.side, quantity=r.quantity, price=r.price
                 )
-                if err:
-                    errors.append(err)
+            )
 
         # Auto-execute watchlist changes
-        if result.watchlist_changes:
-            for change in result.watchlist_changes:
-                err = await _execute_watchlist_change(
-                    db, change.ticker, change.action
-                )
-                if err:
-                    errors.append(err)
+        applied = []
+        for change in llm.watchlist_changes:
+            err = await _execute_watchlist_change(db, change.ticker, change.action)
+            if err:
+                errors.append(err)
+            else:
+                applied.append(change)
 
-        # Append errors to message if any
+        message = llm.message
         if errors:
-            result.message += "\n\n(Errors: " + "; ".join(errors) + ")"
+            message += "\n\nSome actions could not be completed:\n" + "\n".join(
+                f"- {err}" for err in errors
+            )
+
+        result = ChatResponse(
+            message=message,
+            trades=executed or None,
+            watchlist_changes=applied or None,
+        )
 
         # Store messages
         now = datetime.now(timezone.utc).isoformat()

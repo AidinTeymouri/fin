@@ -44,7 +44,7 @@ export default function PositionsTable({ positions, prices }: PositionsTableProp
                 <td className="py-1 pr-2 text-right">${pos.avg_cost.toFixed(2)}</td>
                 <td className="py-1 pr-2 text-right">${livePrice.toFixed(2)}</td>
                 <td className={`py-1 pr-2 text-right ${color}`}>
-                  {pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}
+                  {pnl >= 0 ? "+" : "-"}${Math.abs(pnl).toFixed(2)}
                 </td>
                 <td className={`py-1 text-right ${color}`}>
                   {pnlPct >= 0 ? "+" : ""}{pnlPct.toFixed(1)}%

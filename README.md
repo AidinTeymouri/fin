@@ -65,7 +65,8 @@ cd frontend && npm test
 E2E (Playwright, runs against the app container with `LLM_MOCK=true`):
 
 ```bash
-docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
+docker compose -f test/docker-compose.test.yml up --build \
+  --abort-on-container-exit --exit-code-from playwright
 ```
 
 ## AI chat (`POST /api/chat`)

@@ -23,3 +23,11 @@ out/
 .pytest_cache/
 test-results/
 playwright-report/
+
+# Gas Town (added by gt)
+
+.opencode/
+state.json
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md

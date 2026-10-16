@@ -1,0 +1,42 @@
+# E2E stack (SPEC §12): app container + Playwright container.
+#
+#   docker compose -f test/docker-compose.test.yml up --build \
+#     --abort-on-container-exit --exit-code-from playwright
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      - LLM_MOCK=true
+      - MASSIVE_API_KEY=
+      # tmpfs below: every container start gets a fresh, empty database
+      - DB_PATH=/data/finally.db
+    tmpfs:
+      - /data
+    healthcheck:
+      # python:3.12-slim has no curl, so probe with the stdlib
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  playwright:
+    # Keep in lockstep with @playwright/test in package.json
+    image: mcr.microsoft.com/playwright:v1.52.0-jammy
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      - BASE_URL=http://app:8000
+      - CI=true
+    working_dir: /work
+    volumes:
+      - ./:/work
+      # Container-local node_modules; never touches the host checkout
+      - /work/node_modules
+    command: sh -c "npm ci --no-audit --no-fund && npx playwright test"
